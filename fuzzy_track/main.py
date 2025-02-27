@@ -1,278 +1,284 @@
-import pygame
-import math
 import numpy as np
-from dataclasses import dataclass
-import time
-from typing import List, Tuple
+import matplotlib.pyplot as plt
+from scipy.interpolate import splprep, splev
+from skfuzzy import control as ctrl
+import numpy as np
 
 
-@dataclass
-class Car:
-    mass: float  # kg
-    friction_coefficient: float
-    position: pygame.Vector2
-    velocity: pygame.Vector2
-    heading: float  # radians
-    lateral_acceleration: float = 0
-    length: float = 4.0  # meters
-    width: float = 2.0  # meters
+def generate_race_track():
+    # Define key control points for the track (mix of curves and straights)
+    control_points = (
+        np.array(
+            [
+                [0, 0],
+                [2, 1],
+                [4, 1],  # First straight
+                [6, 2],
+                [7, 5],
+                [6, 6],  # First curve
+                [4, 7],
+                [2, 7],
+                [0, 6],  # Second straight
+                [-2, 5],
+                [-4, 4],
+                [-2, 1],  # Second curve
+                [0, 0],  # Close the loop
+            ]
+        ).T
+        * 1000
+    )  # Transpose for compatibility
+
+    # Generate a smooth spline curve through control points
+    tck, u = splprep(control_points, s=0, per=True)  # Closed curve
+    u_fine = np.linspace(0, 1, 5000)  # Increased number of points for smoothness
+    smooth_track = splev(u_fine, tck)
+
+    return smooth_track[:2]
 
 
-class CircuitSimulation:
-    def __init__(self, screen_width=1200, screen_height=800, pixels_per_meter=10):
-        pygame.init()
-        self.screen = pygame.display.set_mode((screen_width, screen_height))
-        self.clock = pygame.time.Clock()
-        self.pixels_per_meter = pixels_per_meter
+def generate_road_limits(race_track, width=4):
+    """
+    Gera os limites interno e externo da estrada com largura constante.
+    """
+    x, y = race_track
 
-        # Generate track waypoints
-        self.waypoints = self.generate_track()
-        self.current_waypoint = 0
+    # Calcular a direção tangente à pista
+    dx = np.gradient(x)
+    dy = np.gradient(y)
 
-        # Create car instance
-        self.car = Car(
-            mass=1500,  # kg
-            friction_coefficient=0.7,
-            position=pygame.Vector2(self.waypoints[0]),
-            velocity=pygame.Vector2(0, 0),
-            heading=0,
+    # Calcular a direção perpendicular (vetor normal)
+    norm = np.sqrt(dx**2 + dy**2)
+    nx = -dy / norm
+    ny = dx / norm
+
+    # Calcular os limites interno e externo
+    x_inner = x - nx * width / 2
+    y_inner = y - ny * width / 2
+    x_outer = x + nx * width / 2
+    y_outer = y + ny * width / 2
+
+    return np.column_stack((x_inner, y_inner, x_outer, y_outer))
+
+
+# Gerar os pontos suavizados da pista
+race_track = generate_race_track()
+
+# Gerar os limites da estrada com largura constante de 20 metros
+limits = generate_road_limits(race_track)
+
+
+class FuzzyCar:
+    def __init__(self, width, length, max_speed=10):
+        self.width = width
+        self.length = length
+        self.max_speed = max_speed
+        self.curr_speed = 0
+        self.curr_angle = -np.pi / 2
+        self.current_pos = (0, 0)
+        self.state = pd.DataFrame(
+            [[0, 0, 0, 0, *self.velocity()]],
+            columns=["Proximity Diff.", "Delta Diff.", "Delta Angle", "Acceleration", "Speed", "Angle"],
         )
 
-        self.running = True
-        self.last_time = time.time()
-        self.user_acceleration = 0  # m/s²
-        self.road_width = self.car.width * 2  # Road width is twice the car's width
-        self.crashed = False  # Track if the car has gone off-road
+        proximity_diff = ctrl.Antecedent(np.arange(-0.5, 0.51, 0.001), "proximity_diff")
+        delta_diff = ctrl.Antecedent(np.arange(-0.05, 0.051, 0.0001), "delta_diff")
 
-    def meters_to_pixels(self, meters):
-        return int(meters * self.pixels_per_meter)
+        acceleration = ctrl.Consequent(np.arange(-0.1, 0.1, 0.001), "acceleration")
 
-    def generate_track(self) -> List[pygame.Vector2]:
-        """Generate a simple oval track"""
-        waypoints = []
-        center_x, center_y = self.screen.get_width() // 2, self.screen.get_height() // 2
-        radius_x, radius_y = 300, 200  # Semi-major and semi-minor axes
+        # Positivo: margem direita mais próxima
+        proximity_diff.automf(names=["NG", "NM", "NP", "ZE", "PP", "PM", "PG"])
+        delta_diff.automf(names=["NG", "NM", "NP", "ZE", "PP", "PM", "PG"])
 
-        # Generate more waypoints for smoother navigation
-        for angle in np.linspace(0, 2 * math.pi, 100):
-            x = center_x + radius_x * math.cos(angle)
-            y = center_y + radius_y * math.sin(angle)
-            waypoints.append(pygame.Vector2(x, y))
+        # Positivo: sentido anti-horário
+        max_radian = 15 * np.pi / 180  # 15 degrees in radians
 
-        return waypoints
+        # Create the antecedent
+        delta_angle = ctrl.Consequent(np.arange(-max_radian, max_radian, 0.001), "angle")
 
-    def calculate_steering(self) -> float:
-        """Calculate required steering angle to next waypoint"""
-        target = self.waypoints[self.current_waypoint]
-        to_target = target - self.car.position
+        delta_angle.automf(names=["NG", "NM", "NP", "ZE", "PP", "PM", "PG"])
+        acceleration.automf(names=["NG", "NM", "NP", "ZE", "PP", "PM", "PG"])
 
-        # If close enough to current waypoint, move to next one
-        if to_target.length() < 20:
-            self.current_waypoint = (self.current_waypoint + 1) % len(self.waypoints)
-            target = self.waypoints[self.current_waypoint]
-            to_target = target - self.car.position
-
-        # Calculate angle to target
-        target_angle = math.atan2(to_target.y, to_target.x)
-        angle_diff = (target_angle - self.car.heading) % (2 * math.pi)
-        if angle_diff > math.pi:
-            angle_diff -= 2 * math.pi
-
-        return angle_diff * 2.0
-
-    def calculate_forces(self):
-        dt = time.time() - self.last_time
-        self.last_time = time.time()
-
-        # Calculate steering
-        steering = self.calculate_steering()
-        self.car.heading += steering * dt
-
-        # Convert heading to direction vector
-        direction = pygame.Vector2(math.cos(self.car.heading), math.sin(self.car.heading))
-
-        # Apply acceleration in car's forward direction
-        if self.user_acceleration != 0:  # Only apply friction when accelerating or braking
-            acceleration_vector = direction * self.user_acceleration
-
-            # Calculate velocity
-            self.car.velocity += acceleration_vector * dt
-
-            # Apply friction only when accelerating/braking
-            friction_force = -self.car.velocity * self.car.friction_coefficient
-            self.car.velocity += friction_force * dt
-
-        # Update position using current velocity
-        self.car.position += self.car.velocity * dt
-
-        # Calculate lateral acceleration
-        velocity_magnitude = self.car.velocity.length()
-        if velocity_magnitude > 0:
-            velocity_direction = self.car.velocity / velocity_magnitude
-            angle_diff = math.acos(direction.dot(velocity_direction))
-            self.car.lateral_acceleration = velocity_magnitude * math.sin(angle_diff)
-        else:
-            self.car.lateral_acceleration = 0
-
-    def is_car_on_road(self) -> bool:
-        """Check if the car is within the road boundaries"""
-        # Find the nearest segment of the track
-        min_distance = float("inf")
-        nearest_point = None
-        for i in range(len(self.waypoints)):
-            start = self.waypoints[i]
-            end = self.waypoints[(i + 1) % len(self.waypoints)]
-
-            # Vector from start to end of the segment
-            segment = end - start
-            segment_length = segment.length()
-            segment_direction = segment / segment_length
-
-            # Vector from start to car position
-            to_car = self.car.position - start
-
-            # Project to_car onto the segment
-            projection = to_car.dot(segment_direction)
-
-            # Clamp the projection to the segment
-            projection = max(0, min(projection, segment_length))
-
-            # Find the closest point on the segment
-            closest_point = start + segment_direction * projection
-
-            # Calculate distance from the car to the closest point
-            distance = (self.car.position - closest_point).length()
-
-            # Update the nearest point
-            if distance < min_distance:
-                min_distance = distance
-                nearest_point = closest_point
-
-        # Check if the car is within the road width
-        return min_distance <= self.road_width
-
-    def draw_road(self):
-        """Render the road by drawing the boundaries and filling the area between them"""
-        if len(self.waypoints) < 2:
-            return
-
-        # Draw the road as a filled polygon
-        inner_boundary = []
-        outer_boundary = []
-
-        for i in range(len(self.waypoints)):
-            start = self.waypoints[i]
-            end = self.waypoints[(i + 1) % len(self.waypoints)]
-
-            # Calculate the direction of the segment
-            segment = end - start
-            segment_length = segment.length()
-            segment_direction = segment / segment_length
-
-            # Calculate the perpendicular direction
-            perpendicular = pygame.Vector2(-segment_direction.y, segment_direction.x)
-
-            # Calculate the inner and outer boundary points
-            inner_point = start + perpendicular * (-self.road_width / 2)
-            outer_point = start + perpendicular * (self.road_width / 2)
-
-            inner_boundary.append(inner_point)
-            outer_boundary.append(outer_point)
-
-        # Combine the boundaries to form a polygon
-        road_polygon = inner_boundary + outer_boundary[::-1]
-
-        # Draw the filled polygon
-        pygame.draw.polygon(self.screen, (200, 200, 200), road_polygon)
-
-        # Draw the road boundaries
-        pygame.draw.lines(self.screen, (0, 0, 0), True, inner_boundary, 2)
-        pygame.draw.lines(self.screen, (0, 0, 0), True, outer_boundary, 2)
-
-    def draw(self):
-        self.screen.fill((255, 255, 255))
-
-        # Draw the road
-        self.draw_road()
-
-        # Draw waypoints
-        for i, point in enumerate(self.waypoints):
-            color = (255, 0, 0) if i == self.current_waypoint else (128, 128, 128)
-            pygame.draw.circle(self.screen, color, point, 3)
-
-        # Draw car
-        car_surface = pygame.Surface(
-            (self.meters_to_pixels(self.car.length), self.meters_to_pixels(self.car.width)), pygame.SRCALPHA
-        )
-
-        pygame.draw.rect(car_surface, (0, 0, 255), car_surface.get_rect())
-
-        # Rotate car surface
-        rotated_surface = pygame.transform.rotate(car_surface, -math.degrees(self.car.heading))
-
-        # Draw car at its position
-        car_rect = rotated_surface.get_rect(center=self.car.position)
-        self.screen.blit(rotated_surface, car_rect)
-
-        # Draw telemetry
-        font = pygame.font.Font(None, 36)
-        texts = [
-            f"Lateral Acceleration: {self.car.lateral_acceleration:.2f} m/s²",
-            f"Speed: {self.car.velocity.length():.2f} m/s",
-            f"Target Acceleration: {self.user_acceleration:.2f} m/s²",
+        rules = [
+            # Angulação
+            # ctrl.Rule(proximity_diff["NG"], delta_angle["NG"]),
+            # ctrl.Rule(proximity_diff["NM"], delta_angle["NM"]),
+            # ctrl.Rule(proximity_diff["NP"], delta_angle["NP"]),
+            # ctrl.Rule(proximity_diff["ZE"], delta_angle["ZE"]),
+            # ctrl.Rule(proximity_diff["PP"], delta_angle["PP"]),
+            # ctrl.Rule(proximity_diff["PM"], delta_angle["PM"]),
+            # ctrl.Rule(proximity_diff["PG"], delta_angle["PG"]),
+            # Aceleração
+            # ctrl.Rule(proximity_diff["NG"], acceleration["NM"]),
+            # ctrl.Rule(proximity_diff["NM"], acceleration["NP"]),
+            # ctrl.Rule(proximity_diff["NP"], acceleration["PP"]),
+            # ctrl.Rule(proximity_diff["ZE"], acceleration["PM"]),
+            # ctrl.Rule(proximity_diff["PP"], acceleration["PP"]),
+            # ctrl.Rule(proximity_diff["PM"], acceleration["NP"]),
+            # ctrl.Rule(proximity_diff["PG"], acceleration["NM"]),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["NG"], (delta_angle["NG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["NM"], (delta_angle["NG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["NP"], (delta_angle["NG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["ZE"], (delta_angle["NG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["PP"], (delta_angle["NM"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["PM"], (delta_angle["NP"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NG"] & delta_diff["PG"], (delta_angle["ZE"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["NG"], (delta_angle["NG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["NM"], (delta_angle["NG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["NP"], (delta_angle["NG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["ZE"], (delta_angle["NM"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["PP"], (delta_angle["NP"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["PM"], (delta_angle["ZE"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NM"] & delta_diff["PG"], (delta_angle["PP"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["NG"], (delta_angle["NG"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["NM"], (delta_angle["NG"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["NP"], (delta_angle["NM"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["ZE"], (delta_angle["NP"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["PP"], (delta_angle["ZE"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["PM"], (delta_angle["PP"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["NP"] & delta_diff["PG"], (delta_angle["PM"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["NG"], (delta_angle["NG"], acceleration["PM"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["NM"], (delta_angle["NM"], acceleration["PM"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["NP"], (delta_angle["NP"], acceleration["PG"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["ZE"], (delta_angle["ZE"], acceleration["PG"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["PP"], (delta_angle["PP"], acceleration["PG"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["PM"], (delta_angle["PM"], acceleration["PM"])),
+            ctrl.Rule(proximity_diff["ZE"] & delta_diff["PG"], (delta_angle["PG"], acceleration["PM"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["NG"], (delta_angle["NM"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["NM"], (delta_angle["NP"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["NP"], (delta_angle["ZE"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["ZE"], (delta_angle["PP"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["PP"], (delta_angle["PM"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["PM"], (delta_angle["PG"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PP"] & delta_diff["PG"], (delta_angle["PG"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["NG"], (delta_angle["NP"], acceleration["PP"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["NM"], (delta_angle["ZE"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["NP"], (delta_angle["PP"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["ZE"], (delta_angle["PM"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["PP"], (delta_angle["PG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["PM"], (delta_angle["PG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PM"] & delta_diff["PG"], (delta_angle["PG"], acceleration["NM"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["NG"], (delta_angle["ZE"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["NM"], (delta_angle["PP"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["NP"], (delta_angle["PM"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["ZE"], (delta_angle["PG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["PP"], (delta_angle["PG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["PM"], (delta_angle["PG"], acceleration["NG"])),
+            ctrl.Rule(proximity_diff["PG"] & delta_diff["PG"], (delta_angle["PG"], acceleration["NG"])),
         ]
 
-        for i, text in enumerate(texts):
-            surface = font.render(text, True, (0, 0, 0))
-            self.screen.blit(surface, (10, 10 + i * 30))
+        # Criando o sistema de controle e simulacao
+        control_system = ctrl.ControlSystem(rules)
+        self.fuzzy_sim = ctrl.ControlSystemSimulation(control_system)
+        # self.fuzzy_sim.input["proximity_diff"] = 0.0
+        # self.fuzzy_sim.input["delta_diff"] = 0.0
+        # self.fuzzy_sim.compute()
+        # acceleration.view(sim=self.fuzzy_sim)
 
-        # Show crash warning if off-road
-        if self.crashed:
-            warning_text = font.render("CRASHED! Press SPACE to restart", True, (255, 0, 0))
-            self.screen.blit(warning_text, (self.screen.get_width() // 2 - 200, self.screen.get_height() // 2))
+    def velocity(self):
+        return np.array((self.curr_speed, self.curr_angle))
 
-        pygame.display.flip()
+    def nearest_limit_points_diff(self, limits):
+        inner_dists = np.sum(np.square(limits[:, :2] - self.current_pos), axis=1)
+        outer_dists = np.sum(np.square(limits[:, 2:] - self.current_pos), axis=1)
+        min_outer = np.sqrt(min(outer_dists))
+        min_inner = np.sqrt(min(inner_dists))
 
-    def restart_simulation(self):
-        """Reset the simulation to its initial state"""
-        self.car.position = pygame.Vector2(self.waypoints[0])
-        self.car.velocity = pygame.Vector2(0, 0)
-        self.car.heading = 0
-        self.user_acceleration = 0
-        self.crashed = False
+        if min_outer > 4.5 or min_inner > 4.5:
+            raise Exception("Fora da pista")
 
-    def run(self):
-        while self.running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                elif event.type == pygame.KEYDOWN:
-                    # Increase/decrease acceleration on key press
-                    if event.key == pygame.K_UP:
-                        self.user_acceleration = min(self.user_acceleration + 5, 30)  # m/s²
-                    elif event.key == pygame.K_DOWN:
-                        self.user_acceleration = max(self.user_acceleration - 5, -10)  # m/s²
-                    elif event.key == pygame.K_SPACE and self.crashed:
-                        self.restart_simulation()
+        return min_outer - min_inner
 
-            # Check if the car is off-road
-            if not self.crashed and not self.is_car_on_road():
-                self.crashed = True
-                self.user_acceleration = 0  # Stop the car
+    def update_state(self, proximity_diff, delta_diff, delta_angle, accel):
+        self.state.loc[len(self.state)] = np.array(
+            [
+                proximity_diff,
+                delta_diff,
+                delta_angle,
+                accel,
+                *self.velocity(),
+            ]
+        ).round(6)
 
-            # Calculate physics only if not crashed
-            if not self.crashed:
-                self.calculate_forces()
+    def update_position(self, limits):
+        proximity_diff = self.nearest_limit_points_diff(limits)
+        delta_diff = proximity_diff - self.state.values[-1][0]
 
-            # Draw everything
-            self.draw()
+        self.fuzzy_sim.input["proximity_diff"] = proximity_diff
+        self.fuzzy_sim.input["delta_diff"] = delta_diff
 
-            # Maintain 60 FPS
-            self.clock.tick(60)
+        self.fuzzy_sim.compute()
+        angle_delta = self.fuzzy_sim.output["angle"]
+        accel = self.fuzzy_sim.output["acceleration"] * 2
 
-        pygame.quit()
+        self.update_state(proximity_diff, delta_diff, angle_delta, accel)
+
+        self.curr_speed += accel
+        self.curr_speed = np.clip(self.curr_speed, 0, self.max_speed)
+
+        self.curr_angle += angle_delta
+
+        self.current_pos = self.current_pos + self.curr_speed * np.array(
+            [np.sin(self.curr_angle), np.cos(self.curr_angle)]
+        )
+
+        return self.current_pos
 
 
-if __name__ == "__main__":
-    simulation = CircuitSimulation()
-    simulation.run()
+car = FuzzyCar(2, 4)
+car_path = []
+
+for _ in range(len(race_track[0])):
+    try:
+        pos = car.update_position(limits)
+    except Exception as e:
+        if str(e) == "Fora da pista":
+            print("FORA DA PISTA")
+            break
+        else:
+            print(car.state)
+            raise e
+
+    car_path.append(pos)
+
+car_path = np.array(car_path)
+
+
+def calculate_plot_limits(car_path, margin=0.1):
+    # Ensure car_path is a numpy array
+    car_path = np.array(car_path)
+
+    # Extract x and y coordinates
+    x = car_path[:, 0]
+    y = car_path[:, 1]
+
+    # Calculate bounds for zooming
+    x_min, x_max = np.min(x), np.max(x)
+    y_min, y_max = np.min(y), np.max(y)
+
+    # Add margin
+    margin_x = margin * (x_max - x_min)
+    margin_y = margin * (y_max - y_min)
+
+    # Return the calculated limits
+    return (x_min - margin_x, x_max + margin_x), (y_min - margin_y, y_max + margin_y)
+
+
+# # Plotar a pista e os limites da estrada
+xlim, ylim = calculate_plot_limits(car_path, margin=1)
+plt.figure(figsize=(10, 6))
+plt.scatter(race_track[0], race_track[1], label="Centro da Pista", color="blue", linestyle="--", s=0.5)
+plt.plot(car_path[:, 0], car_path[:, 1], label="Caminho do carro", color="red")
+# plt.plot(limits[:, 0], limits[:, 1], label="Limite Interno", color="green")
+# plt.plot(limits[:, 2], limits[:, 3], label="Limite Externo", color="green")
+plt.title("Pista de Corrida")
+plt.xlabel("X (metros)")
+plt.ylabel("Y (metros)")
+plt.axis("equal")
+plt.legend()
+
+plt.xlim(xlim)
+plt.ylim(ylim)
+
+# Set equal aspect ratio
+plt.show()
+car.state
